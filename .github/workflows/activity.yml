@@ -1,0 +1,296 @@
+name: Daily public activity (24h) → Pages (TOML)
+
+on:
+  # Dual crons to cover DST; script guards to only emit at 5 PM America/New_York
+  schedule:
+    - cron: "5 21 * * *"  # 5:05 PM EDT (UTC-4) ~ Mar–Nov
+    - cron: "5 22 * * *"  # 5:05 PM EST (UTC-5) ~ Nov–Mar
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run regardless of local-time guard (for testing)"
+        type: boolean
+        default: false
+      hours:
+        description: "Lookback window in hours"
+        type: number
+        default: 24
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate last-24h activity (TOML) + HTML
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USERNAME: "matthewdeanmartin"
+          SITE_TITLE: "Matthew Dean Martin — Last 24h Public Activity"
+          INLINE_CSS: "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:2rem;line-height:1.55}header{margin-bottom:1rem}article{max-width:900px}time{opacity:.8}li{margin:.25rem 0}.repo{font-weight:600}.etype{font-size:.85em;opacity:.75;padding:.1rem .35rem;border:1px solid #ddd;border-radius:.4rem;margin-left:.35rem}"
+          FORCE_RUN: ${{ inputs.force }}
+          WINDOW_HOURS: ${{ inputs.hours }}
+        run: |
+          python - << 'PY'
+          import os, html, textwrap
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+          import requests
+
+          GH_API = "https://api.github.com"
+          TOKEN = os.environ.get("GITHUB_TOKEN")
+          USERNAME = os.environ.get("USERNAME", "matthewdeanmartin")
+          SITE_TITLE = os.environ.get("SITE_TITLE", f"{USERNAME} — Last 24h Public Activity")
+          INLINE_CSS = os.environ.get("INLINE_CSS", "")
+          FORCE_RUN = (os.environ.get("FORCE_RUN","false").lower() == "true")
+          WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS","24") or "24")
+
+          # --- Guard so we only publish at 5 PM America/New_York (unless forced)
+          ny = ZoneInfo("America/New_York")
+          now_utc = datetime.now(timezone.utc)
+          now_local = now_utc.astimezone(ny)
+          if not FORCE_RUN and now_local.hour != 17:
+              print(f"Local time is {now_local.isoformat()}, not 5 PM. Skipping (set force=true to override).")
+              raise SystemExit(0)
+
+          since = now_utc - timedelta(hours=WINDOW_HOURS)
+          yesterday_local = (now_local - timedelta(days=1)).strftime("%Y-%m-%d")
+
+          sess = requests.Session()
+          sess.headers.update({
+              "Authorization": f"Bearer {TOKEN}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": f"{USERNAME}-daily-activity"
+          })
+
+          def iso_utc(dt: datetime) -> str:
+              return dt.astimezone(timezone.utc).isoformat()
+
+          def gh_get(url, params=None):
+              items = []
+              while True:
+                  r = sess.get(url, params=params)
+                  r.raise_for_status()
+                  data = r.json()
+                  if isinstance(data, list):
+                      items.extend(data)
+                  else:
+                      return data
+                  link = r.headers.get("Link","")
+                  nxt = None
+                  for part in link.split(","):
+                      if 'rel="next"' in part:
+                          nxt = part[part.find("<")+1:part.find(">")]
+                  if not nxt:
+                      break
+                  url, params = nxt, None
+              return items
+
+          # Fetch public events within window
+          events_raw = gh_get(f"{GH_API}/users/{USERNAME}/events/public", {"per_page": 100})
+          events_raw = [e for e in events_raw
+                        if datetime.fromisoformat(e["created_at"].replace("Z","+00:00")) >= since]
+
+          # Summarize → spelled-out keys to keep meaning & reduce noise
+          def summarize(e):
+              t = e["type"]
+              repo = e.get("repo",{}).get("name","")
+              at_utc = e["created_at"]
+              url = None
+              title = None
+              details = []
+              p = e.get("payload",{}) or {}
+
+              if t == "PushEvent":
+                  commits = p.get("commits",[]) or []
+                  for c in commits:
+                      msg = (c.get("message") or "").strip().replace("\n"," ")
+                      sha = (c.get("sha") or "")[:7]
+                      u_commit = f"https://github.com/{repo}/commit/{c.get('sha','')}"
+                      details.append(f"Commit {sha}: {msg} — {u_commit}")
+                  title = f"Pushed {len(commits)} commit(s)"
+                  url = f"https://github.com/{repo}/compare/{p.get('before','')}...{p.get('head','')}"
+              elif t == "PullRequestEvent":
+                  action = p.get("action")
+                  pr = p.get("pull_request",{}) or {}
+                  url = pr.get("html_url")
+                  title = f"PR {action}: #{pr.get('number')} — {pr.get('title')}"
+                  if pr.get("merged"):
+                      t = "PullRequestEvent (merged)"
+              elif t == "IssuesEvent":
+                  action = p.get("action")
+                  issue = p.get("issue",{}) or {}
+                  url = issue.get("html_url")
+                  title = f"Issue {action}: #{issue.get('number')} — {issue.get('title')}"
+              elif t == "IssueCommentEvent":
+                  issue = p.get("issue",{}) or {}
+                  comment = p.get("comment",{}) or {}
+                  url = comment.get("html_url") or issue.get("html_url")
+                  title = f"Issue comment on #{issue.get('number')} — {issue.get('title')}"
+                  body = (comment.get("body") or "").strip().splitlines()
+                  if body:
+                      details.append("Comment: " + body[0][:160])
+              elif t == "PullRequestReviewCommentEvent":
+                  comment = p.get("comment",{}) or {}
+                  pr = p.get("pull_request",{}) or {}
+                  url = comment.get("html_url") or pr.get("html_url")
+                  title = f"PR review on #{pr.get('number')} — {pr.get('title')}"
+                  body = (comment.get("body") or "").strip().splitlines()
+                  if body:
+                      details.append("Review: " + body[0][:160])
+              elif t == "ReleaseEvent":
+                  action = p.get("action")
+                  rel = p.get("release",{}) or {}
+                  url = rel.get("html_url")
+                  title = f"Release {action}: {rel.get('tag_name')} — {(rel.get('name') or '').strip()}"
+              elif t == "CreateEvent":
+                  ref_type = p.get("ref_type")
+                  ref = p.get("ref")
+                  url = f"https://github.com/{repo}" if ref_type not in ("tag","branch") else f"https://github.com/{repo}/tree/{ref}"
+                  title = f"Created {ref_type}: {ref or ''}".strip()
+              elif t == "DeleteEvent":
+                  ref_type = p.get("ref_type")
+                  ref = p.get("ref")
+                  url = f"https://github.com/{repo}"
+                  title = f"Deleted {ref_type}: {ref}"
+              elif t == "WatchEvent":
+                  url = f"https://github.com/{repo}"
+                  title = f"Starred {repo}"
+              else:
+                  url = f"https://github.com/{repo}"
+                  title = t
+
+              return {
+                "type": t,
+                "repo": repo,
+                "at_utc": at_utc,
+                "url": url,
+                "title": title,
+                "details": details,
+              }
+
+          events = [summarize(e) for e in events_raw]
+          events.sort(key=lambda x: x["at_utc"])
+
+          # --- tiny TOML writer (no deps), spelled-out keys
+          def esc(s: str) -> str:
+              return s.replace("\\","\\\\").replace('"','\\"')
+
+          def kv(k, v):
+              return f'{k} = "{esc(v)}"\n'
+
+          def arr_str(arr):
+              return "[" + ", ".join(f'"{esc(x)}"' for x in arr) + "]\n"
+
+          # Output paths (archive by *local* date for readability)
+          os.makedirs("docs/activity", exist_ok=True)
+          day_slug_local = now_local.strftime("%Y-%m-%d")
+          day_path = f"docs/activity/{day_slug_local}.toml"
+          latest_path = "docs/latest.toml"
+          prev_rel = f"activity/{yesterday_local}.toml"
+          index_path = "docs/index.html"
+
+          # Write daily archive TOML
+          with open(day_path, "w", encoding="utf-8") as f:
+              f.write(kv("generated_utc", now_utc.isoformat()))
+              f.write(kv("window_start_utc", since.isoformat()))
+              f.write(kv("username", USERNAME))
+              f.write(kv("prev", prev_rel))
+              for ev in events:
+                  f.write("\n[[event]]\n")
+                  f.write(kv("type", ev["type"]))
+                  f.write(kv("repo", ev["repo"]))
+                  f.write(kv("at_utc", ev["at_utc"]))
+                  if ev["url"]:
+                      f.write(kv("url", ev["url"]))
+                  f.write(kv("title", ev["title"]))
+                  if ev["details"]:
+                      f.write("details = " + arr_str(ev["details"]))
+
+          # Write latest.toml (canonical filename)
+          with open(latest_path, "w", encoding="utf-8") as f:
+              f.write(kv("generated_utc", now_utc.isoformat()))
+              f.write(kv("window_start_utc", since.isoformat()))
+              f.write(kv("username", USERNAME))
+              f.write(kv("prev", prev_rel))
+              for ev in events:
+                  f.write("\n[[event]]\n")
+                  f.write(kv("type", ev["type"]))
+                  f.write(kv("repo", ev["repo"]))
+                  f.write(kv("at_utc", ev["at_utc"]))
+                  if ev["url"]:
+                      f.write(kv("url", ev["url"]))
+                  f.write(kv("title", ev["title"]))
+                  if ev["details"]:
+                      f.write("details = " + arr_str(ev["details"]))
+
+          # Lightweight HTML index (human skim)
+          def h(s: str) -> str:
+              return html.escape(s, quote=True)
+
+          def render(ev):
+              dhtml = ""
+              if ev["details"]:
+                  dhtml = "<ul>" + "".join(f"<li>{h(x)}</li>" for x in ev["details"]) + "</ul>"
+              u = ev.get("url") or f"https://github.com/{ev['repo']}"
+              return f"""
+              <li>
+                <span class="repo">{h(ev['repo'])}</span>
+                <span class="etype">{h(ev['type'])}</span><br/>
+                <a href="{h(u)}">{h(ev['title'])}</a><br/>
+                <time datetime="{h(ev['at_utc'])}">{h(ev['at_utc'])} UTC</time>
+                {dhtml}
+              </li>"""
+
+          items = "<p>No public activity in the last 24 hours.</p>" if not events else "<ol>" + "".join(render(e) for e in events) + "</ol>"
+          html_doc = f"""<!doctype html>
+          <html lang="en">
+          <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>{h(SITE_TITLE)}</title>
+          <style>{INLINE_CSS}</style>
+          <body>
+            <header>
+              <h1>{h(SITE_TITLE)}</h1>
+              <p><strong>Window (UTC):</strong> {h(since.isoformat())} → {h(now_utc.isoformat())}</p>
+              <p>TOML: <a href="latest.toml">latest.toml</a> • Daily archive: <a href="activity/{h(day_slug_local)}.toml">{h(day_slug_local)}.toml</a> • Prev: <a href="{h(prev_rel)}">{h(prev_rel)}</a></p>
+            </header>
+            <article>{items}</article>
+            <footer><p>Generated at {h(now_utc.isoformat())}.</p></footer>
+          </body></html>"""
+          with open(index_path, "w", encoding="utf-8") as f:
+              f.write(textwrap.dedent(html_doc))
+
+          print(f"Wrote {index_path}, {day_path}, {latest_path}")
+          PY
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
