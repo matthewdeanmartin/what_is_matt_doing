@@ -1,10 +1,10 @@
-name: Daily public activity (24h) → Pages (TOML)
+name: Daily public activity (24h) → Pages (TOML + 7d)
 
 on:
   # Dual crons to cover DST; script guards to only emit at 5 PM America/New_York
   schedule:
-    - cron: "5 21 * * *"  # 5:05 PM EDT (UTC-4) ~ Mar–Nov
-    - cron: "5 22 * * *"  # 5:05 PM EST (UTC-5) ~ Nov–Mar
+    - cron: "5 21 * * *"  # 5:05 PM EDT (UTC-4)
+    - cron: "5 22 * * *"  # 5:05 PM EST (UTC-5)
   workflow_dispatch:
     inputs:
       force:
@@ -37,39 +37,47 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Generate last-24h activity (TOML) + HTML
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests
+
+      - name: Generate activity (24h + 7d) TOML + HTML
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           USERNAME: "matthewdeanmartin"
-          SITE_TITLE: "Matthew Dean Martin — Last 24h Public Activity"
-          INLINE_CSS: "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:2rem;line-height:1.55}header{margin-bottom:1rem}article{max-width:900px}time{opacity:.8}li{margin:.25rem 0}.repo{font-weight:600}.etype{font-size:.85em;opacity:.75;padding:.1rem .35rem;border:1px solid #ddd;border-radius:.4rem;margin-left:.35rem}"
+          SITE_TITLE: "Matthew Dean Martin — Public Activity"
+          INLINE_CSS: "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:2rem;line-height:1.55}header{margin-bottom:1rem}article{max-width:960px}time{opacity:.8}li{margin:.25rem 0}.repo{font-weight:600}.etype{font-size:.85em;opacity:.75;padding:.1rem .35rem;border:1px solid #ddd;border-radius:.4rem;margin-left:.35rem}"
           FORCE_RUN: ${{ inputs.force }}
           WINDOW_HOURS: ${{ inputs.hours }}
         run: |
-          python -m pip install requests
           python - << 'PY'
-          import os, html, textwrap
+          import os, html, textwrap, math
+          from collections import Counter, defaultdict
           from datetime import datetime, timedelta, timezone
           from zoneinfo import ZoneInfo
           import requests
 
+          SCHEMA_VERSION = "1"
+          TZ_NAME = "America/New_York"
           GH_API = "https://api.github.com"
           TOKEN = os.environ.get("GITHUB_TOKEN")
           USERNAME = os.environ.get("USERNAME", "matthewdeanmartin")
-          SITE_TITLE = os.environ.get("SITE_TITLE", f"{USERNAME} — Last 24h Public Activity")
+          SITE_TITLE = os.environ.get("SITE_TITLE", f"{USERNAME} — Public Activity")
           INLINE_CSS = os.environ.get("INLINE_CSS", "")
           FORCE_RUN = (os.environ.get("FORCE_RUN","false").lower() == "true")
           WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS","24") or "24")
 
-          # --- Guard so we only publish at 5 PM America/New_York (unless forced)
-          ny = ZoneInfo("America/New_York")
+          ny = ZoneInfo(TZ_NAME)
           now_utc = datetime.now(timezone.utc)
           now_local = now_utc.astimezone(ny)
           if not FORCE_RUN and now_local.hour != 17:
               print(f"Local time is {now_local.isoformat()}, not 5 PM. Skipping (set force=true to override).")
               raise SystemExit(0)
 
-          since = now_utc - timedelta(hours=WINDOW_HOURS)
+          # windows
+          since_24h = now_utc - timedelta(hours=WINDOW_HOURS)
+          since_7d = now_utc - timedelta(days=7)
           yesterday_local = (now_local - timedelta(days=1)).strftime("%Y-%m-%d")
 
           sess = requests.Session()
@@ -79,9 +87,6 @@ jobs:
               "X-GitHub-Api-Version": "2022-11-28",
               "User-Agent": f"{USERNAME}-daily-activity"
           })
-
-          def iso_utc(dt: datetime) -> str:
-              return dt.astimezone(timezone.utc).isoformat()
 
           def gh_get(url, params=None):
               items = []
@@ -103,43 +108,53 @@ jobs:
                   url, params = nxt, None
               return items
 
-          # Fetch public events within window
-          events_raw = gh_get(f"{GH_API}/users/{USERNAME}/events/public", {"per_page": 100})
-          events_raw = [e for e in events_raw
-                        if datetime.fromisoformat(e["created_at"].replace("Z","+00:00")) >= since]
+          # fetch events once (up to a few pages) and slice by time
+          raw = gh_get(f"{GH_API}/users/{USERNAME}/events/public", {"per_page": 100})
 
-          # Summarize → spelled-out keys to keep meaning & reduce noise
+          def in_window(e, since_dt):
+              return datetime.fromisoformat(e["created_at"].replace("Z","+00:00")) >= since_dt
+
+          raw_24h = [e for e in raw if in_window(e, since_24h)]
+          raw_7d  = [e for e in raw if in_window(e, since_7d)]
+
           def summarize(e):
-              t = e["type"]
-              repo = e.get("repo",{}).get("name","")
+              etype = e["type"]
+              repo_full = (e.get("repo",{}) or {}).get("name","")
+              if "/" in repo_full:
+                  owner, name = repo_full.split("/", 1)
+              else:
+                  owner, name = repo_full, ""
               at_utc = e["created_at"]
+              event_id = e.get("id","")
               url = None
               title = None
               details = []
               p = e.get("payload",{}) or {}
+              commit_prefix_url = None
+              commits = []
 
-              if t == "PushEvent":
-                  commits = p.get("commits",[]) or []
-                  for c in commits:
+              if etype == "PushEvent":
+                  cs = p.get("commits",[]) or []
+                  for c in cs:
                       msg = (c.get("message") or "").strip().replace("\n"," ")
                       sha = (c.get("sha") or "")[:7]
-                      u_commit = f"https://github.com/{repo}/commit/{c.get('sha','')}"
-                      details.append(f"Commit {sha}: {msg} — {u_commit}")
-                  title = f"Pushed {len(commits)} commit(s)"
-                  url = f"https://github.com/{repo}/compare/{p.get('before','')}...{p.get('head','')}"
-              elif t == "PullRequestEvent":
+                      commits.append(f"{sha}: {msg}")
+                  title = f"Pushed {len(cs)} commit(s)"
+                  url = f"https://github.com/{repo_full}/compare/{p.get('before','')}...{p.get('head','')}"
+                  commit_prefix_url = f"https://github.com/{repo_full}/commit/"
+              elif etype == "PullRequestEvent":
                   action = p.get("action")
                   pr = p.get("pull_request",{}) or {}
                   url = pr.get("html_url")
                   title = f"PR {action}: #{pr.get('number')} — {pr.get('title')}"
                   if pr.get("merged"):
-                      t = "PullRequestEvent (merged)"
-              elif t == "IssuesEvent":
+                      etype = "PullRequestEvent (merged)"
+              elif etype == "IssuesEvent":
                   action = p.get("action")
                   issue = p.get("issue",{}) or {}
                   url = issue.get("html_url")
                   title = f"Issue {action}: #{issue.get('number')} — {issue.get('title')}"
-              elif t == "IssueCommentEvent":
+              elif etype == "IssueCommentEvent":
                   issue = p.get("issue",{}) or {}
                   comment = p.get("comment",{}) or {}
                   url = comment.get("html_url") or issue.get("html_url")
@@ -147,7 +162,7 @@ jobs:
                   body = (comment.get("body") or "").strip().splitlines()
                   if body:
                       details.append("Comment: " + body[0][:160])
-              elif t == "PullRequestReviewCommentEvent":
+              elif etype == "PullRequestReviewCommentEvent":
                   comment = p.get("comment",{}) or {}
                   pr = p.get("pull_request",{}) or {}
                   url = comment.get("html_url") or pr.get("html_url")
@@ -155,129 +170,235 @@ jobs:
                   body = (comment.get("body") or "").strip().splitlines()
                   if body:
                       details.append("Review: " + body[0][:160])
-              elif t == "ReleaseEvent":
+              elif etype == "ReleaseEvent":
                   action = p.get("action")
                   rel = p.get("release",{}) or {}
                   url = rel.get("html_url")
                   title = f"Release {action}: {rel.get('tag_name')} — {(rel.get('name') or '').strip()}"
-              elif t == "CreateEvent":
+              elif etype == "CreateEvent":
                   ref_type = p.get("ref_type")
                   ref = p.get("ref")
-                  url = f"https://github.com/{repo}" if ref_type not in ("tag","branch") else f"https://github.com/{repo}/tree/{ref}"
+                  url = f"https://github.com/{repo_full}" if ref_type not in ("tag","branch") else f"https://github.com/{repo_full}/tree/{ref}"
                   title = f"Created {ref_type}: {ref or ''}".strip()
-              elif t == "DeleteEvent":
+              elif etype == "DeleteEvent":
                   ref_type = p.get("ref_type")
                   ref = p.get("ref")
-                  url = f"https://github.com/{repo}"
+                  url = f"https://github.com/{repo_full}"
                   title = f"Deleted {ref_type}: {ref}"
-              elif t == "WatchEvent":
-                  url = f"https://github.com/{repo}"
-                  title = f"Starred {repo}"
+              elif etype == "WatchEvent":
+                  url = f"https://github.com/{repo_full}"
+                  title = f"Starred {repo_full}"
               else:
-                  url = f"https://github.com/{repo}"
-                  title = t
+                  url = f"https://github.com/{repo_full}"
+                  title = etype
 
-              return {
-                "type": t,
-                "repo": repo,
+              ev = {
+                "type": etype,
+                "repo_owner": owner,
+                "repo_name": name,
                 "at_utc": at_utc,
                 "url": url,
                 "title": title,
                 "details": details,
+                "event_id": event_id,
               }
+              if commit_prefix_url:
+                  ev["commit_prefix_url"] = commit_prefix_url
+              if commits:
+                  ev["commits"] = commits
+              return ev
 
-          events = [summarize(e) for e in events_raw]
-          events.sort(key=lambda x: x["at_utc"])
+          events_24h = [summarize(e) for e in raw_24h]
+          events_7d  = [summarize(e) for e in raw_7d]
+          events_24h.sort(key=lambda x: x["at_utc"])
+          events_7d.sort(key=lambda x: x["at_utc"])
 
-          # --- tiny TOML writer (no deps), spelled-out keys
+          def count(events, prefix):
+              return sum(1 for e in events if e["type"].startswith(prefix))
+
+          summary_24h = {
+            "events": len(events_24h),
+            "repos": len({(e["repo_owner"], e["repo_name"]) for e in events_24h}),
+            "pushes": count(events_24h, "PushEvent"),
+            "pull_requests": count(events_24h, "PullRequestEvent"),
+            "issues": count(events_24h, "IssuesEvent"),
+            "comments": count(events_24h, "IssueCommentEvent") + count(events_24h, "PullRequestReviewCommentEvent"),
+            "releases": count(events_24h, "ReleaseEvent"),
+            "stars": count(events_24h, "WatchEvent"),
+            "creates": count(events_24h, "CreateEvent"),
+            "deletes": count(events_24h, "DeleteEvent"),
+          }
+
+          summary_7d = {
+            "events": len(events_7d),
+            "repos": len({(e["repo_owner"], e["repo_name"]) for e in events_7d}),
+            "pushes": count(events_7d, "PushEvent"),
+            "pull_requests": count(events_7d, "PullRequestEvent"),
+            "issues": count(events_7d, "IssuesEvent"),
+            "comments": count(events_7d, "IssueCommentEvent") + count(events_7d, "PullRequestReviewCommentEvent"),
+            "releases": count(events_7d, "ReleaseEvent"),
+            "stars": count(events_7d, "WatchEvent"),
+            "creates": count(events_7d, "CreateEvent"),
+            "deletes": count(events_7d, "DeleteEvent"),
+          }
+
+          # insights to make quiet weeks still informative
+          # streak days & busiest local day
+          by_day = Counter(datetime.fromisoformat(e["at_utc"].replace("Z","+00:00")).astimezone(ny).strftime("%Y-%m-%d") for e in events_7d)
+          streak_days = len([d for d,c in by_day.items() if c>0])
+          busiest_day_local = max(by_day.items(), key=lambda kv: kv[1])[0] if by_day else ""
+
+          top_repos = Counter(f"{e['repo_owner']}/{e['repo_name']}" for e in events_7d if e["repo_owner"] or e["repo_name"])
+          top_event_types = Counter(e["type"] for e in events_7d)
+
+          insights_7d = {
+            "quiet_week": summary_7d["events"] < 5,
+            "streak_days": streak_days,
+            "busiest_day_local": busiest_day_local,
+            "top_repos": [f"{k}:{v}" for k,v in top_repos.most_common(5)],
+            "top_event_types": [f"{k}:{v}" for k,v in top_event_types.most_common(5)],
+          }
+
+          # --- tiny TOML writer
           def esc(s: str) -> str:
               return s.replace("\\","\\\\").replace('"','\\"')
 
           def kv(k, v):
               return f'{k} = "{esc(v)}"\n'
 
+          def kv_noquote(k, v):
+              return f"{k} = {v}\n"
+
           def arr_str(arr):
               return "[" + ", ".join(f'"{esc(x)}"' for x in arr) + "]\n"
 
-          # Output paths (archive by *local* date for readability)
           os.makedirs("docs/activity", exist_ok=True)
           day_slug_local = now_local.strftime("%Y-%m-%d")
           day_path = f"docs/activity/{day_slug_local}.toml"
-          latest_path = "docs/latest.toml"
+          latest_24h_path = "docs/latest.toml"
+          latest_7d_path = "docs/latest-7d.toml"
           prev_rel = f"activity/{yesterday_local}.toml"
+          self_rel = f"activity/{day_slug_local}.toml"
           index_path = "docs/index.html"
 
-          # Write daily archive TOML
-          with open(day_path, "w", encoding="utf-8") as f:
-              f.write(kv("generated_utc", now_utc.isoformat()))
-              f.write(kv("window_start_utc", since.isoformat()))
-              f.write(kv("username", USERNAME))
-              f.write(kv("prev", prev_rel))
-              for ev in events:
-                  f.write("\n[[event]]\n")
-                  f.write(kv("type", ev["type"]))
-                  f.write(kv("repo", ev["repo"]))
-                  f.write(kv("at_utc", ev["at_utc"]))
-                  if ev["url"]:
-                      f.write(kv("url", ev["url"]))
-                  f.write(kv("title", ev["title"]))
-                  if ev["details"]:
-                      f.write("details = " + arr_str(ev["details"]))
+          def write_events(path, window_start_dt, events, summary_block_name, summary_vals, extra_blocks=None):
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(kv("schema_version", SCHEMA_VERSION))
+                  f.write(kv("username", USERNAME))
+                  f.write(kv("generated_utc", now_utc.isoformat()))
+                  f.write(kv("window_start_utc", window_start_dt.isoformat()))
+                  f.write(kv("tz", TZ_NAME))
+                  f.write(kv("self", self_rel if "latest" not in path else path.replace("docs/","")))
+                  f.write(kv("prev", prev_rel))
+                  f.write(f"\n[{summary_block_name}]\n")
+                  for k, v in summary_vals.items():
+                      f.write(kv_noquote(k, v))
+                  if extra_blocks:
+                      for blk_name, blk_dict in extra_blocks.items():
+                          f.write(f"\n[{blk_name}]\n")
+                          for k, v in blk_dict.items():
+                              if isinstance(v, bool):
+                                  f.write(f"{k} = {str(v).lower()}\n")
+                              elif isinstance(v, int):
+                                  f.write(kv_noquote(k, v))
+                              elif isinstance(v, list):
+                                  f.write(f"{k} = " + arr_str(v))
+                              else:
+                                  f.write(kv(k, str(v)))
+                  for ev in events:
+                      f.write("\n[[event]]\n")
+                      f.write(kv("type", ev["type"]))
+                      f.write(kv("repo_owner", ev["repo_owner"]))
+                      f.write(kv("repo_name", ev["repo_name"]))
+                      f.write(kv("at_utc", ev["at_utc"]))
+                      if ev.get("url"):
+                          f.write(kv("url", ev["url"]))
+                      f.write(kv("title", ev["title"]))
+                      f.write(kv("event_id", ev["event_id"]))
+                      if ev.get("commit_prefix_url"):
+                          f.write(kv("commit_prefix_url", ev["commit_prefix_url"]))
+                      if ev.get("commits"):
+                          f.write("commits = " + arr_str(ev["commits"]))
+                      if ev.get("details"):
+                          f.write("details = " + arr_str(ev["details"]))
 
-          # Write latest.toml (canonical filename)
-          with open(latest_path, "w", encoding="utf-8") as f:
-              f.write(kv("generated_utc", now_utc.isoformat()))
-              f.write(kv("window_start_utc", since.isoformat()))
-              f.write(kv("username", USERNAME))
-              f.write(kv("prev", prev_rel))
-              for ev in events:
-                  f.write("\n[[event]]\n")
-                  f.write(kv("type", ev["type"]))
-                  f.write(kv("repo", ev["repo"]))
-                  f.write(kv("at_utc", ev["at_utc"]))
-                  if ev["url"]:
-                      f.write(kv("url", ev["url"]))
-                  f.write(kv("title", ev["title"]))
-                  if ev["details"]:
-                      f.write("details = " + arr_str(ev["details"]))
+          # write files
+          write_events(day_path, since_24h, events_24h, "summary", summary_24h)
+          write_events(latest_24h_path, since_24h, events_24h, "summary", summary_24h)
+          write_events(latest_7d_path, since_7d, events_7d, "summary_7d", summary_7d, extra_blocks={"insights_7d": insights_7d})
 
-          # Lightweight HTML index (human skim)
-          def h(s: str) -> str:
-              return html.escape(s, quote=True)
-
+          # --- HTML
+          def h(s: str) -> str: return html.escape(s, quote=True)
           def render(ev):
-              dhtml = ""
-              if ev["details"]:
-                  dhtml = "<ul>" + "".join(f"<li>{h(x)}</li>" for x in ev["details"]) + "</ul>"
-              u = ev.get("url") or f"https://github.com/{ev['repo']}"
-              return f"""
-              <li>
-                <span class="repo">{h(ev['repo'])}</span>
-                <span class="etype">{h(ev['type'])}</span><br/>
-                <a href="{h(u)}">{h(ev['title'])}</a><br/>
-                <time datetime="{h(ev['at_utc'])}">{h(ev['at_utc'])} UTC</time>
-                {dhtml}
-              </li>"""
+              u = ev.get("url") or f"https://github.com/{ev['repo_owner']}/{ev['repo_name']}"
+              html_parts = [
+                f'<li><span class="repo">{h(ev["repo_owner"])}/{h(ev["repo_name"])}</span> <span class="etype">{h(ev["type"])}</span><br/>',
+                f'<a href="{h(u)}">{h(ev["title"])}</a><br/>',
+                f'<time datetime="{h(ev["at_utc"])}">{h(ev["at_utc"])}</time>'
+              ]
+              if ev.get("commits"):
+                  prefix = ev.get("commit_prefix_url","")
+                  html_parts.append("<ul>" + "".join(
+                      f'<li><a href="{h(prefix + c.split(":")[0])}">{h(c)}</a></li>' if prefix else f"<li>{h(c)}</li>"
+                      for c in ev["commits"]
+                  ) + "</ul>")
+              if ev.get("details"):
+                  html_parts.append("<ul>" + "".join(f"<li>{h(x)}</li>" for x in ev["details"]) + "</ul>")
+              html_parts.append("</li>")
+              return "".join(html_parts)
 
-          items = "<p>No public activity in the last 24 hours.</p>" if not events else "<ol>" + "".join(render(e) for e in events) + "</ol>"
+          items_24h = "<p>No public activity in the last 24 hours.</p>" if not events_24h else "<ol>" + "".join(render(e) for e in events_24h) + "</ol>"
+
+          # tiny week-at-a-glance
+          glance_rows = [
+            ("Events", summary_7d["events"]),
+            ("Repos", summary_7d["repos"]),
+            ("Pushes", summary_7d["pushes"]),
+            ("PRs", summary_7d["pull_requests"]),
+            ("Issues", summary_7d["issues"]),
+            ("Comments", summary_7d["comments"]),
+            ("Releases", summary_7d["releases"]),
+            ("Stars", summary_7d["stars"]),
+          ]
+          glance_html = "<table><tbody>" + "".join(f"<tr><td>{h(k)}</td><td>{v}</td></tr>" for k,v in glance_rows) + "</tbody></table>"
+          insights_html = ""
+          if summary_7d["events"] == 0:
+              insights_html = "<p>Quiet week. (No public events in the last 7 days.)</p>"
+          else:
+              insights_html = "<p><strong>Week insights:</strong> " \
+                              f"streak days: {insights_7d['streak_days']}; " \
+                              f"busiest day: {h(insights_7d['busiest_day_local'])}; " \
+                              f"top repos: {h(', '.join(insights_7d['top_repos']))}; " \
+                              f"top event types: {h(', '.join(insights_7d['top_event_types']))}.</p>"
+
           html_doc = f"""<!doctype html>
           <html lang="en">
-          <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta name="robots" content="index,follow">
+          <link rel="alternate" type="application/toml" href="latest.toml">
+          <link rel="alternate" type="application/toml" href="latest-7d.toml">
           <title>{h(SITE_TITLE)}</title>
           <style>{INLINE_CSS}</style>
           <body>
             <header>
               <h1>{h(SITE_TITLE)}</h1>
-              <p><strong>Window (UTC):</strong> {h(since.isoformat())} → {h(now_utc.isoformat())}</p>
-              <p>TOML: <a href="latest.toml">latest.toml</a> • Daily archive: <a href="activity/{h(day_slug_local)}.toml">{h(day_slug_local)}.toml</a> • Prev: <a href="{h(prev_rel)}">{h(prev_rel)}</a></p>
+              <p><strong>24h Window (UTC):</strong> {h(since_24h.isoformat())} → {h(now_utc.isoformat())}</p>
+              <p><a href="latest.toml">latest.toml (24h)</a> • <a href="latest-7d.toml">latest-7d.toml</a> • Daily archive: <a href="activity/{h(day_slug_local)}.toml">{h(day_slug_local)}.toml</a> • Prev: <a href="{h(prev_rel)}">{h(prev_rel)}</a></p>
             </header>
-            <article>{items}</article>
+            <article>
+              <h2>Last 24 hours</h2>
+              {items_24h}
+              <h2>Week at a glance</h2>
+              {glance_html}
+              {insights_html}
+            </article>
             <footer><p>Generated at {h(now_utc.isoformat())}.</p></footer>
           </body></html>"""
           with open(index_path, "w", encoding="utf-8") as f:
               f.write(textwrap.dedent(html_doc))
 
-          print(f"Wrote {index_path}, {day_path}, {latest_path}")
+          print(f"Wrote {index_path}, {day_path}, {latest_24h_path}, {latest_7d_path}")
           PY
 
       - name: Upload Pages artifact
