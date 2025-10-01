@@ -46,6 +46,7 @@ jobs:
           FORCE_RUN: ${{ inputs.force }}
           WINDOW_HOURS: ${{ inputs.hours }}
         run: |
+          python -m pip install requests
           python - << 'PY'
           import os, html, textwrap
           from datetime import datetime, timedelta, timezone
