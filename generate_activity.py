@@ -1,0 +1,385 @@
+import os
+import html
+import textwrap
+# math is imported but seemingly unused in original snippet, keeping just in case
+import math
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+import requests
+
+# --- Configuration & Defaults ---
+SCHEMA_VERSION = "1"
+# You can override these via Environment Variables in the YAML if needed
+TZ_NAME = os.environ.get("TZ_NAME", "America/New_York")
+GH_API = "https://api.github.com"
+TOKEN = os.environ.get("GITHUB_TOKEN")
+USERNAME = os.environ.get("USERNAME", "matthewdeanmartin")
+SITE_TITLE = os.environ.get("SITE_TITLE", f"{USERNAME} — Public Activity")
+
+# Moved CSS here to clean up the YAML
+DEFAULT_CSS = (
+    "body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;"
+    "margin:2rem;line-height:1.55}header{margin-bottom:1rem}article{max-width:960px}"
+    "time{opacity:.8}li{margin:.25rem 0}.repo{font-weight:600}"
+    ".etype{font-size:.85em;opacity:.75;padding:.1rem .35rem;border:1px solid #ddd;"
+    "border-radius:.4rem;margin-left:.35rem}"
+)
+INLINE_CSS = os.environ.get("INLINE_CSS", DEFAULT_CSS)
+
+FORCE_RUN = (os.environ.get("FORCE_RUN", "false").lower() == "true")
+WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "24") or "24")
+
+
+def main():
+    if not TOKEN:
+        raise ValueError("GITHUB_TOKEN environment variable is missing.")
+
+    ny = ZoneInfo(TZ_NAME)
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(ny)
+
+    # 1. Time Guard (skip if not ~5 PM local, unless forced)
+    if not FORCE_RUN and now_local.hour != 17:
+        print(f"Local time is {now_local.isoformat()}, not 5 PM. Skipping (set force=true to override).")
+        raise SystemExit(0)
+
+    # 2. Setup Time Windows
+    since_24h = now_utc - timedelta(hours=WINDOW_HOURS)
+    since_7d = now_utc - timedelta(days=7)
+    yesterday_local = (now_local - timedelta(days=1)).strftime("%Y-%m-%d")
+    day_slug_local = now_local.strftime("%Y-%m-%d")
+
+    # 3. Setup Requests
+    sess = requests.Session()
+    sess.headers.update({
+        "Authorization": f"Bearer {TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": f"{USERNAME}-daily-activity"
+    })
+
+    # 4. Fetch Events
+    def gh_get(url, params=None):
+        items = []
+        while True:
+            r = sess.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                items.extend(data)
+            else:
+                return data
+
+            link = r.headers.get("Link", "")
+            nxt = None
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    nxt = part[part.find("<") + 1:part.find(">")]
+            if not nxt:
+                break
+            url, params = nxt, None
+        return items
+
+    print(f"Fetching events for {USERNAME}...")
+    raw = gh_get(f"{GH_API}/users/{USERNAME}/events/public", {"per_page": 100})
+
+    def in_window(e, since_dt):
+        created_at = datetime.fromisoformat(e["created_at"].replace("Z", "+00:00"))
+        return created_at >= since_dt
+
+    raw_24h = [e for e in raw if in_window(e, since_24h)]
+    raw_7d = [e for e in raw if in_window(e, since_7d)]
+
+    # 5. Process/Summarize Events
+    def summarize(e):
+        etype = e["type"]
+        repo_full = (e.get("repo", {}) or {}).get("name", "")
+        if "/" in repo_full:
+            owner, name = repo_full.split("/", 1)
+        else:
+            owner, name = repo_full, ""
+
+        at_utc = e["created_at"]
+        event_id = e.get("id", "")
+        url = None
+        title = None
+        details = []
+        p = e.get("payload", {}) or {}
+        commit_prefix_url = None
+        commits = []
+
+        if etype == "PushEvent":
+            cs = p.get("commits", []) or []
+            for c in cs:
+                msg = (c.get("message") or "").strip().replace("\n", " ")
+                sha = (c.get("sha") or "")[:7]
+                commits.append(f"{sha}: {msg}")
+            title = f"Pushed {len(cs)} commit(s)"
+            url = f"https://github.com/{repo_full}/compare/{p.get('before', '')}...{p.get('head', '')}"
+            commit_prefix_url = f"https://github.com/{repo_full}/commit/"
+        elif etype == "PullRequestEvent":
+            action = p.get("action")
+            pr = p.get("pull_request", {}) or {}
+            url = pr.get("html_url")
+            title = f"PR {action}: #{pr.get('number')} — {pr.get('title')}"
+            if pr.get("merged"):
+                etype = "PullRequestEvent (merged)"
+        elif etype == "IssuesEvent":
+            action = p.get("action")
+            issue = p.get("issue", {}) or {}
+            url = issue.get("html_url")
+            title = f"Issue {action}: #{issue.get('number')} — {issue.get('title')}"
+        elif etype == "IssueCommentEvent":
+            issue = p.get("issue", {}) or {}
+            comment = p.get("comment", {}) or {}
+            url = comment.get("html_url") or issue.get("html_url")
+            title = f"Issue comment on #{issue.get('number')} — {issue.get('title')}"
+            body = (comment.get("body") or "").strip().splitlines()
+            if body:
+                details.append("Comment: " + body[0][:160])
+        elif etype == "PullRequestReviewCommentEvent":
+            comment = p.get("comment", {}) or {}
+            pr = p.get("pull_request", {}) or {}
+            url = comment.get("html_url") or pr.get("html_url")
+            title = f"PR review on #{pr.get('number')} — {pr.get('title')}"
+            body = (comment.get("body") or "").strip().splitlines()
+            if body:
+                details.append("Review: " + body[0][:160])
+        elif etype == "ReleaseEvent":
+            action = p.get("action")
+            rel = p.get("release", {}) or {}
+            url = rel.get("html_url")
+            title = f"Release {action}: {rel.get('tag_name')} — {(rel.get('name') or '').strip()}"
+        elif etype == "CreateEvent":
+            ref_type = p.get("ref_type")
+            ref = p.get("ref")
+            url = f"https://github.com/{repo_full}" if ref_type not in ("tag",
+                                                                        "branch") else f"https://github.com/{repo_full}/tree/{ref}"
+            title = f"Created {ref_type}: {ref or ''}".strip()
+        elif etype == "DeleteEvent":
+            ref_type = p.get("ref_type")
+            ref = p.get("ref")
+            url = f"https://github.com/{repo_full}"
+            title = f"Deleted {ref_type}: {ref}"
+        elif etype == "WatchEvent":
+            url = f"https://github.com/{repo_full}"
+            title = f"Starred {repo_full}"
+        else:
+            url = f"https://github.com/{repo_full}"
+            title = etype
+
+        ev = {
+            "type": etype,
+            "repo_owner": owner,
+            "repo_name": name,
+            "at_utc": at_utc,
+            "url": url,
+            "title": title,
+            "details": details,
+            "event_id": event_id,
+        }
+        if commit_prefix_url:
+            ev["commit_prefix_url"] = commit_prefix_url
+        if commits:
+            ev["commits"] = commits
+        return ev
+
+    events_24h = [summarize(e) for e in raw_24h]
+    events_7d = [summarize(e) for e in raw_7d]
+    events_24h.sort(key=lambda x: x["at_utc"])
+    events_7d.sort(key=lambda x: x["at_utc"])
+
+    # 6. Generate Statistics
+    def count(events, prefix):
+        return sum(1 for e in events if e["type"].startswith(prefix))
+
+    def get_stats(ev_list):
+        return {
+            "events": len(ev_list),
+            "repos": len({(e["repo_owner"], e["repo_name"]) for e in ev_list}),
+            "pushes": count(ev_list, "PushEvent"),
+            "pull_requests": count(ev_list, "PullRequestEvent"),
+            "issues": count(ev_list, "IssuesEvent"),
+            "comments": count(ev_list, "IssueCommentEvent") + count(ev_list, "PullRequestReviewCommentEvent"),
+            "releases": count(ev_list, "ReleaseEvent"),
+            "stars": count(ev_list, "WatchEvent"),
+            "creates": count(ev_list, "CreateEvent"),
+            "deletes": count(ev_list, "DeleteEvent"),
+        }
+
+    summary_24h = get_stats(events_24h)
+    summary_7d = get_stats(events_7d)
+
+    # 7. Insights (Streak, Busiest Day)
+    by_day = Counter(
+        datetime.fromisoformat(e["at_utc"].replace("Z", "+00:00")).astimezone(ny).strftime("%Y-%m-%d")
+        for e in events_7d
+    )
+    streak_days = len([d for d, c in by_day.items() if c > 0])
+    busiest_day_local = max(by_day.items(), key=lambda kv: kv[1])[0] if by_day else ""
+
+    top_repos = Counter(f"{e['repo_owner']}/{e['repo_name']}" for e in events_7d if e["repo_owner"] or e["repo_name"])
+    top_event_types = Counter(e["type"] for e in events_7d)
+
+    insights_7d = {
+        "quiet_week": summary_7d["events"] < 5,
+        "streak_days": streak_days,
+        "busiest_day_local": busiest_day_local,
+        "top_repos": [f"{k}:{v}" for k, v in top_repos.most_common(5)],
+        "top_event_types": [f"{k}:{v}" for k, v in top_event_types.most_common(5)],
+    }
+
+    # 8. TOML Helpers
+    def esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    def kv(k, v):
+        return f'{k} = "{esc(v)}"\n'
+
+    def kv_noquote(k, v):
+        return f"{k} = {v}\n"
+
+    def arr_str(arr):
+        return "[" + ", ".join(f'"{esc(x)}"' for x in arr) + "]\n"
+
+    # 9. Write TOML Files
+    os.makedirs("docs/activity", exist_ok=True)
+    day_path = f"docs/activity/{day_slug_local}.toml"
+    latest_24h_path = "docs/latest.toml"
+    latest_7d_path = "docs/latest-7d.toml"
+    prev_rel = f"activity/{yesterday_local}.toml"
+    self_rel = f"activity/{day_slug_local}.toml"
+
+    def write_events(path, window_start_dt, events, summary_block_name, summary_vals, extra_blocks=None):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(kv("schema_version", SCHEMA_VERSION))
+            f.write(kv("username", USERNAME))
+            f.write(kv("generated_utc", now_utc.isoformat()))
+            f.write(kv("window_start_utc", window_start_dt.isoformat()))
+            f.write(kv("tz", TZ_NAME))
+            f.write(kv("self", self_rel if "latest" not in path else path.replace("docs/", "")))
+            f.write(kv("prev", prev_rel))
+
+            f.write(f"\n[{summary_block_name}]\n")
+            for k, v in summary_vals.items():
+                f.write(kv_noquote(k, v))
+
+            if extra_blocks:
+                for blk_name, blk_dict in extra_blocks.items():
+                    f.write(f"\n[{blk_name}]\n")
+                    for k, v in blk_dict.items():
+                        if isinstance(v, bool):
+                            f.write(f"{k} = {str(v).lower()}\n")
+                        elif isinstance(v, int):
+                            f.write(kv_noquote(k, v))
+                        elif isinstance(v, list):
+                            f.write(f"{k} = " + arr_str(v))
+                        else:
+                            f.write(kv(k, str(v)))
+
+            for ev in events:
+                f.write("\n[[event]]\n")
+                f.write(kv("type", ev["type"]))
+                f.write(kv("repo_owner", ev["repo_owner"]))
+                f.write(kv("repo_name", ev["repo_name"]))
+                f.write(kv("at_utc", ev["at_utc"]))
+                if ev.get("url"):
+                    f.write(kv("url", ev["url"]))
+                f.write(kv("title", ev["title"]))
+                f.write(kv("event_id", ev["event_id"]))
+                if ev.get("commit_prefix_url"):
+                    f.write(kv("commit_prefix_url", ev["commit_prefix_url"]))
+                if ev.get("commits"):
+                    f.write("commits = " + arr_str(ev["commits"]))
+                if ev.get("details"):
+                    f.write("details = " + arr_str(ev["details"]))
+
+    write_events(day_path, since_24h, events_24h, "summary", summary_24h)
+    write_events(latest_24h_path, since_24h, events_24h, "summary", summary_24h)
+    write_events(latest_7d_path, since_7d, events_7d, "summary_7d", summary_7d,
+                 extra_blocks={"insights_7d": insights_7d})
+
+    # 10. Generate HTML
+    def h(s: str) -> str:
+        return html.escape(s, quote=True)
+
+    def render_event(ev):
+        u = ev.get("url") or f"https://github.com/{ev['repo_owner']}/{ev['repo_name']}"
+        html_parts = [
+            f'<li><span class="repo">{h(ev["repo_owner"])}/{h(ev["repo_name"])}</span> <span class="etype">{h(ev["type"])}</span><br/>',
+            f'<a href="{h(u)}">{h(ev["title"])}</a><br/>',
+            f'<time datetime="{h(ev["at_utc"])}">{h(ev["at_utc"])}</time>'
+        ]
+        if ev.get("commits"):
+            prefix = ev.get("commit_prefix_url", "")
+            html_parts.append("<ul>" + "".join(
+                f'<li><a href="{h(prefix + c.split(":")[0])}">{h(c)}</a></li>' if prefix else f"<li>{h(c)}</li>"
+                for c in ev["commits"]
+            ) + "</ul>")
+        if ev.get("details"):
+            html_parts.append("<ul>" + "".join(f"<li>{h(x)}</li>" for x in ev["details"]) + "</ul>")
+        html_parts.append("</li>")
+        return "".join(html_parts)
+
+    items_24h = "<p>No public activity in the last 24 hours.</p>" if not events_24h else "<ol>" + "".join(
+        render_event(e) for e in events_24h) + "</ol>"
+
+    glance_rows = [
+        ("Events", summary_7d["events"]),
+        ("Repos", summary_7d["repos"]),
+        ("Pushes", summary_7d["pushes"]),
+        ("PRs", summary_7d["pull_requests"]),
+        ("Issues", summary_7d["issues"]),
+        ("Comments", summary_7d["comments"]),
+        ("Releases", summary_7d["releases"]),
+        ("Stars", summary_7d["stars"]),
+    ]
+    glance_html = "<table><tbody>" + "".join(
+        f"<tr><td>{h(k)}</td><td>{v}</td></tr>" for k, v in glance_rows) + "</tbody></table>"
+
+    if summary_7d["events"] == 0:
+        insights_html = "<p>Quiet week. (No public events in the last 7 days.)</p>"
+    else:
+        insights_html = (
+            "<p><strong>Week insights:</strong> "
+            f"streak days: {insights_7d['streak_days']}; "
+            f"busiest day: {h(insights_7d['busiest_day_local'])}; "
+            f"top repos: {h(', '.join(insights_7d['top_repos']))}; "
+            f"top event types: {h(', '.join(insights_7d['top_event_types']))}.</p>"
+        )
+
+    index_path = "docs/index.html"
+    html_doc = f"""<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="index,follow">
+<link rel="alternate" type="application/toml" href="latest.toml">
+<link rel="alternate" type="application/toml" href="latest-7d.toml">
+<title>{h(SITE_TITLE)}</title>
+<style>{INLINE_CSS}</style>
+<body>
+  <header>
+    <h1>{h(SITE_TITLE)}</h1>
+    <p><strong>24h Window (UTC):</strong> {h(since_24h.isoformat())} → {h(now_utc.isoformat())}</p>
+    <p><a href="latest.toml">latest.toml (24h)</a> • <a href="latest-7d.toml">latest-7d.toml</a> • Daily archive: <a href="activity/{h(day_slug_local)}.toml">{h(day_slug_local)}.toml</a> • Prev: <a href="{h(prev_rel)}">{h(prev_rel)}</a></p>
+  </header>
+  <article>
+    <h2>Last 24 hours</h2>
+    {items_24h}
+    <h2>Week at a glance</h2>
+    {glance_html}
+    {insights_html}
+  </article>
+  <footer><p>Generated at {h(now_utc.isoformat())}.</p></footer>
+</body></html>"""
+
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(html_doc))
+
+    print(f"Wrote {index_path}, {day_path}, {latest_24h_path}, {latest_7d_path}")
+
+
+if __name__ == "__main__":
+    main()
